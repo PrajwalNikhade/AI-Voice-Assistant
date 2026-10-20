@@ -82,21 +82,32 @@ export default function ConsentDialog({
         </div>
 
         {/* Affirmative Recording Consent Checkbox */}
-        <div className="p-4 rounded-xl bg-indigo-950/20 border border-indigo-900/40">
+        <div
+          className={`p-4 rounded-xl transition-all border ${
+            recordingConsent
+              ? "bg-indigo-950/40 border-indigo-500/60 shadow-md shadow-indigo-500/10"
+              : "bg-slate-950/40 border-slate-800 hover:border-slate-700"
+          }`}
+        >
           <label className="flex items-start gap-3 cursor-pointer select-none">
             <input
               type="checkbox"
               id="recording-consent-checkbox"
               checked={recordingConsent}
               onChange={(e) => setRecordingConsent(e.target.checked)}
-              className="mt-1 w-4 h-4 rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
+              className="mt-1 w-4 h-4 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
             />
-            <div className="text-xs">
-              <span className="font-semibold text-white">
-                Save audio recording for demonstration & playback (Optional)
-              </span>
-              <p className="text-slate-400 mt-1 leading-relaxed">
-                If checked, both your microphone audio and the AI speech will be mixed and recorded. You can listen to or download it later. If unchecked, the voice call will proceed normally without saving any audio file.
+            <div className="text-xs space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-white">
+                  Save audio recording for demonstration & playback
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-medium">
+                  Recommended for Testing
+                </span>
+              </div>
+              <p className="text-slate-400 leading-relaxed">
+                If checked, both your microphone audio and Alex&apos;s voice will be mixed and recorded. You can listen to or download it later. If unchecked, the voice call will proceed normally without saving any audio file.
               </p>
             </div>
           </label>

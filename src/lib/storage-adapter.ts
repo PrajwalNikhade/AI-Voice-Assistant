@@ -77,11 +77,25 @@ export async function persistCall(
 
       if (res.ok) {
         const saved: CallRecord = await res.json();
+        // Also cache recording in local IndexedDB as resilient backup
+        if (audioBlob) {
+          const db = await getDB();
+          if (db) {
+            await db.put("recordings", {
+              id: callData.id,
+              blob: audioBlob,
+              mimeType: callData.recordingMimeType || audioBlob.type || "audio/webm",
+            });
+            if (!saved.recordingUrl) {
+              saved.recordingUrl = URL.createObjectURL(audioBlob);
+            }
+          }
+        }
         return saved;
       }
-      console.warn("Server call persistence returned error, falling back to local DB");
+      console.warn("[StorageAdapter] Server call persistence returned error, falling back to local DB");
     } catch (err) {
-      console.warn("Server call persistence failed, using local IndexedDB:", err);
+      console.warn("[StorageAdapter] Server call persistence failed, using local IndexedDB:", err);
     }
   }
 

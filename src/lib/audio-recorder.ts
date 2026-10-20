@@ -147,9 +147,12 @@ export class AudioRecordingPipeline {
       };
 
       try {
+        if (this.mediaRecorder.state === "recording") {
+          this.mediaRecorder.requestData();
+        }
         this.mediaRecorder.stop();
       } catch (e) {
-        console.warn("MediaRecorder stop error:", e);
+        console.warn("[AudioRecorder] MediaRecorder stop error:", e);
         const mime = this.selectedMimeType || "audio/webm";
         const completeBlob = new Blob(this.recordedChunks, { type: mime });
         this.isRecording = false;

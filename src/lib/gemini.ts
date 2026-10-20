@@ -2,6 +2,16 @@ import { GoogleGenAI } from "@google/genai";
 import { AISummary, TranscriptMessage, Language, SalesStatus } from "@/types";
 import { PRODUCT_CONFIG } from "@/config/product-config";
 
+import dns from "dns";
+
+try {
+  if (typeof dns.setDefaultResultOrder === "function") {
+    dns.setDefaultResultOrder("ipv4first");
+  }
+} catch {
+  // browser or non-node runtime
+}
+
 export function getGeminiApiKey(): string | null {
   return process.env.GEMINI_API_KEY || null;
 }
@@ -11,7 +21,7 @@ export function getGeminiLiveModel(): string {
 }
 
 export function getGeminiTextModel(): string {
-  return process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
+  return process.env.GEMINI_TEXT_MODEL || "gemini-3.5-flash-lite";
 }
 
 /**
@@ -113,14 +123,33 @@ export async function analyzeCallTranscript(
   const apiKey = getGeminiApiKey();
   const textModel = getGeminiTextModel();
 
-  // Handle empty or very short calls
+  // 1. If customer independently completed demo signup, prioritize Converted
+  if (trialSignupCompleted) {
+    return {
+      summary:
+        "The customer evaluated ResumePilot AI with Alex and successfully completed the free-trial demo signup.",
+      customerRequirements: ["ATS-optimized resume creation and job application assistance"],
+      painPoints: ["Improving interview callback rates with ATS scoring"],
+      objections: [],
+      interestLevel: "high",
+      questionsAsked: [],
+      nextSteps: ["Send free-trial activation guide and recruiter resume templates."],
+      demoRequested: false,
+      trialSignupCompleted: true,
+      salesStatus: "Converted",
+      statusReason:
+        "Customer independently completed and confirmed the free-trial demo signup during the session.",
+    };
+  }
+
+  // 2. Filter customer verbal interactions
   const customerUtterances = transcript.filter((t) => t.speaker === "customer");
   const totalCustomerWords = customerUtterances.reduce(
     (acc, cur) => acc + cur.text.trim().split(/\s+/).filter(Boolean).length,
     0
   );
 
-  if (customerUtterances.length === 0 || totalCustomerWords < 3) {
+  if (customerUtterances.length === 0 || totalCustomerWords < 2) {
     return {
       summary:
         "The call ended without meaningful verbal interaction from the customer.",
@@ -134,7 +163,7 @@ export async function analyzeCallTranscript(
       trialSignupCompleted: false,
       salesStatus: "No Response",
       statusReason:
-        "Customer provided no usable response or the conversation disconnected before customer engagement.",
+        "Customer provided no usable verbal response during the call.",
     };
   }
 

@@ -42,21 +42,39 @@ export default function VoiceAgentPage() {
 
   // Language & Consent
   const [language, setLanguage] = useState<Language>("en");
+  const languageRef = useRef<Language>("en");
+
   const [isConsentModalOpen, setIsConsentModalOpen] = useState<boolean>(false);
   const [hasRecordingConsent, setHasRecordingConsent] = useState<boolean>(false);
+  const hasRecordingConsentRef = useRef<boolean>(false);
+
   const [recordingConsentAt, setRecordingConsentAt] = useState<string | null>(null);
+  const recordingConsentAtRef = useRef<string | null>(null);
 
   // Demo Signup state
   const [isDemoModalOpen, setIsDemoModalOpen] = useState<boolean>(false);
   const [trialSignupCompleted, setTrialSignupCompleted] = useState<boolean>(false);
+  const trialSignupCompletedRef = useRef<boolean>(false);
+
   const [customerName, setCustomerName] = useState<string>("");
+  const customerNameRef = useRef<string>("");
+
   const [customerEmail, setCustomerEmail] = useState<string>("");
+  const customerEmailRef = useRef<string>("");
 
   // Live Conversation Transcript & Timer
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const transcriptRef = useRef<TranscriptMessage[]>([]);
+
   const [durationSeconds, setDurationSeconds] = useState<number>(0);
+  const durationSecondsRef = useRef<number>(0);
+
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Status refs to avoid stale closure in callbacks
+  const callActiveRef = useRef<boolean>(false);
+  const isFinalizingRef = useRef<boolean>(false);
 
   // References to active pipeline & live client
   const liveClientRef = useRef<GeminiLiveClient | null>(null);
@@ -98,15 +116,34 @@ export default function VoiceAgentPage() {
     setIsConsentModalOpen(false);
     setErrorMessage(null);
     setCompletedCall(null);
-    setTranscript([]);
-    setDurationSeconds(0);
-    setTrialSignupCompleted(false);
-    setHasRecordingConsent(consentToRecord);
-    setRecordingConsentAt(consentToRecord ? new Date().toISOString() : null);
 
-    setCallStatus("connecting");
+    // Synchronously update both React state and ref values
+    transcriptRef.current = [];
+    setTranscript([]);
+
+    durationSecondsRef.current = 0;
+    setDurationSeconds(0);
+
+    trialSignupCompletedRef.current = false;
+    setTrialSignupCompleted(false);
+
+    hasRecordingConsentRef.current = consentToRecord;
+    setHasRecordingConsent(consentToRecord);
+
+    const consentTimestamp = consentToRecord ? new Date().toISOString() : null;
+    recordingConsentAtRef.current = consentTimestamp;
+    setRecordingConsentAt(consentTimestamp);
+
+    callActiveRef.current = true;
     setCallActive(true);
-    callStartTimeRef.current = new Date().toISOString();
+    setCallStatus("connecting");
+
+    const startTimestamp = new Date().toISOString();
+    callStartTimeRef.current = startTimestamp;
+
+    console.log(
+      `[VoiceAgent] Starting call session. Recording consent: ${consentToRecord ? "GRANTED" : "DECLINED"}`
+    );
 
     try {
       // 1. Request microphone access
@@ -122,9 +159,10 @@ export default function VoiceAgentPage() {
           },
         });
         micStreamRef.current = micStream;
+        console.log("[VoiceAgent] Microphone stream acquired successfully.");
       } catch (micErr: unknown) {
         throw new Error(
-          `Microphone permission denied or unavailable. Please grant microphone access in Chrome settings: ${(micErr as Error).message}`
+          `Microphone permission denied or unavailable. Please grant microphone access in Chrome: ${(micErr as Error).message}`
         );
       }
 
@@ -150,7 +188,10 @@ export default function VoiceAgentPage() {
 
       // If user consented to recording, start MediaRecorder now
       if (consentToRecord) {
+        console.log("[VoiceAgent] Recording consent granted. Starting dual-audio MediaRecorder...");
         pipeline.startRecording();
+      } else {
+        console.log("[VoiceAgent] Recording consent declined. Audio will not be recorded.");
       }
 
       // 4. Connect to Gemini Live API
@@ -161,20 +202,24 @@ export default function VoiceAgentPage() {
         onTranscriptMessage: (msg) => {
           setTranscript((prev) => {
             const index = prev.findIndex((m) => m.id === msg.id);
+            let updated: TranscriptMessage[];
             if (index !== -1) {
-              const updated = [...prev];
+              updated = [...prev];
               updated[index] = msg;
-              return updated;
+            } else {
+              updated = [...prev, msg];
             }
-            return [...prev, msg];
+            transcriptRef.current = updated;
+            return updated;
           });
         },
         onError: (err) => {
+          console.error("[VoiceAgent] Live client error:", err);
           setErrorMessage(err);
         },
         onClose: () => {
-          // If connection closes unexpectedly
-          if (callActive && !isFinalizing) {
+          console.log("[VoiceAgent] Live client connection closed.");
+          if (callActiveRef.current && !isFinalizingRef.current) {
             handleEndCall();
           }
         },
@@ -187,7 +232,7 @@ export default function VoiceAgentPage() {
         ephemeralToken,
         liveModel,
         voiceName,
-        language,
+        languageRef.current,
         micStream,
         pipeline.getAiInputNode(),
         pipeline.getAudioContext() || undefined
@@ -195,12 +240,14 @@ export default function VoiceAgentPage() {
 
       // 5. Start call duration timer
       timerIntervalRef.current = setInterval(() => {
-        setDurationSeconds((sec) => sec + 1);
+        durationSecondsRef.current += 1;
+        setDurationSeconds(durationSecondsRef.current);
       }, 1000);
     } catch (err: unknown) {
-      console.error("Call initialization failed:", err);
+      console.error("[VoiceAgent] Call initialization error:", err);
       setErrorMessage((err as Error).message);
       setCallStatus("error");
+      callActiveRef.current = false;
       setCallActive(false);
       cleanupMedia();
     }
@@ -210,7 +257,8 @@ export default function VoiceAgentPage() {
    * Ends Call, finalizes recording, analyzes transcript with Gemini, saves to storage
    */
   const handleEndCall = useCallback(async () => {
-    if (!callActive) return;
+    if (!callActiveRef.current || isFinalizingRef.current) return;
+    isFinalizingRef.current = true;
     setIsFinalizing(true);
     setCallStatus("idle");
 
@@ -220,8 +268,23 @@ export default function VoiceAgentPage() {
     }
 
     const endedAt = new Date().toISOString();
-    const finalDuration = durationSeconds;
-    const finalTranscript = [...transcript];
+    const startedAt = callStartTimeRef.current || endedAt;
+    const calculatedDuration = Math.max(
+      0,
+      Math.round((new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000)
+    );
+    const finalDuration = calculatedDuration > 0 ? calculatedDuration : durationSecondsRef.current;
+    const finalTranscript = [...transcriptRef.current];
+    const consent = hasRecordingConsentRef.current;
+    const consentAt = recordingConsentAtRef.current;
+    const isTrialDone = trialSignupCompletedRef.current;
+    const cName = customerNameRef.current;
+    const cEmail = customerEmailRef.current;
+    const currentLang = languageRef.current;
+
+    console.log(
+      `[VoiceAgent] Finalizing call. Duration: ${finalDuration}s, Messages: ${finalTranscript.length}, Consent: ${consent}`
+    );
 
     // 1. Disconnect Gemini Live session
     if (liveClientRef.current) {
@@ -233,15 +296,19 @@ export default function VoiceAgentPage() {
     let audioBlob: Blob | null = null;
     let recordingMime = "audio/webm";
 
-    if (pipelineRef.current && hasRecordingConsent) {
+    if (pipelineRef.current && consent) {
       try {
+        console.log("[VoiceAgent] Stopping and packaging dual-channel audio recording...");
         const result = await pipelineRef.current.stopRecording();
-        if (result?.blob) {
+        if (result?.blob && result.blob.size > 0) {
           audioBlob = result.blob;
           recordingMime = result.mimeType;
+          console.log(`[VoiceAgent] Audio recording package ready: ${audioBlob.size} bytes (${recordingMime})`);
+        } else {
+          console.warn("[VoiceAgent] No recorded audio data received from MediaRecorder.");
         }
       } catch (recErr) {
-        console.warn("Error finalizing audio recording:", recErr);
+        console.warn("[VoiceAgent] Error finalizing audio recording:", recErr);
       }
     }
 
@@ -258,40 +325,44 @@ export default function VoiceAgentPage() {
       questionsAsked: [],
       nextSteps: ["Follow up with customer."],
       demoRequested: false,
-      trialSignupCompleted: trialSignupCompleted,
-      salesStatus: trialSignupCompleted ? "Converted" : "Interested",
-      statusReason: "Conversation recorded and processed.",
+      trialSignupCompleted: isTrialDone,
+      salesStatus: isTrialDone ? "Converted" : "Interested",
+      statusReason: "Conversation processed.",
     };
 
     try {
+      console.log("[VoiceAgent] Requesting post-call analysis...");
       const summaryRes = await fetch("/api/analyze-call", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           transcript: finalTranscript,
-          trialSignupCompleted,
-          language,
+          trialSignupCompleted: isTrialDone,
+          language: currentLang,
         }),
       });
 
       if (summaryRes.ok) {
         aiSummary = await summaryRes.json();
+        console.log(`[VoiceAgent] Analysis complete. Sales Status: ${aiSummary.salesStatus}`);
+      } else {
+        console.warn(`[VoiceAgent] Analysis endpoint returned status ${summaryRes.status}`);
       }
     } catch (analysisErr) {
-      console.warn("AI post-call analysis error, using default summary:", analysisErr);
+      console.warn("[VoiceAgent] AI post-call analysis error, using default summary:", analysisErr);
     }
 
     // 5. Construct CallRecord and save via Unified Storage Adapter
     const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const newRecord: Omit<CallRecord, "storageProvider"> = {
       id: callId,
-      createdAt: callStartTimeRef.current || new Date().toISOString(),
-      startedAt: callStartTimeRef.current || new Date().toISOString(),
+      createdAt: startedAt,
+      startedAt,
       endedAt,
       durationSeconds: finalDuration,
-      contactName: customerName || undefined,
-      contactEmail: customerEmail || undefined,
-      language,
+      contactName: cName || undefined,
+      contactEmail: cEmail || undefined,
+      language: currentLang,
       salesStatus: aiSummary.salesStatus,
       statusReason: aiSummary.statusReason,
       summary: aiSummary.summary,
@@ -301,33 +372,27 @@ export default function VoiceAgentPage() {
       questionsAsked: aiSummary.questionsAsked || [],
       nextSteps: aiSummary.nextSteps || [],
       demoRequested: aiSummary.demoRequested,
-      trialSignupCompleted: trialSignupCompleted || aiSummary.trialSignupCompleted,
+      trialSignupCompleted: isTrialDone || aiSummary.trialSignupCompleted,
       transcript: finalTranscript,
       recordingMimeType: recordingMime,
-      recordingConsent: hasRecordingConsent,
-      recordingConsentAt: recordingConsentAt || undefined,
+      recordingConsent: consent,
+      recordingConsentAt: consentAt || undefined,
     };
 
     try {
+      console.log(`[VoiceAgent] Persisting call record (${callId})...`);
       const saved = await persistCall(newRecord, audioBlob);
       setCompletedCall(saved);
+      console.log(`[VoiceAgent] Call successfully saved via ${saved.storageProvider}.`);
     } catch (persistErr) {
-      console.error("Failed to persist call:", persistErr);
+      console.error("[VoiceAgent] Failed to persist call:", persistErr);
     } finally {
+      callActiveRef.current = false;
+      isFinalizingRef.current = false;
       setCallActive(false);
       setIsFinalizing(false);
     }
-  }, [
-    callActive,
-    durationSeconds,
-    transcript,
-    hasRecordingConsent,
-    trialSignupCompleted,
-    customerName,
-    customerEmail,
-    language,
-    recordingConsentAt,
-  ]);
+  }, []);
 
   const cleanupMedia = () => {
     if (pipelineRef.current) {
@@ -345,21 +410,28 @@ export default function VoiceAgentPage() {
    */
   const handleConfirmDemoSignup = (name: string, email: string) => {
     setCustomerName(name);
+    customerNameRef.current = name;
+
     setCustomerEmail(email);
+    customerEmailRef.current = email;
+
     setTrialSignupCompleted(true);
+    trialSignupCompletedRef.current = true;
 
     // If call is still active, add confirmation note into live transcript
-    if (callActive) {
-      setTranscript((prev) => [
-        ...prev,
-        {
-          id: `system-trial-${Date.now()}`,
-          speaker: "customer",
-          text: `[Trial Confirmed] ${name} (${email || "no email"}) confirmed free trial signup.`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-          isFinal: true,
-        },
-      ]);
+    if (callActiveRef.current) {
+      const signupNote: TranscriptMessage = {
+        id: `system-trial-${Date.now()}`,
+        speaker: "customer",
+        text: `[Trial Confirmed] ${name} (${email || "no email"}) confirmed free trial signup.`,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+        isFinal: true,
+      };
+      setTranscript((prev) => {
+        const updated = [...prev, signupNote];
+        transcriptRef.current = updated;
+        return updated;
+      });
     }
   };
 
@@ -510,7 +582,10 @@ export default function VoiceAgentPage() {
                     key={item.id}
                     type="button"
                     disabled={callActive}
-                    onClick={() => setLanguage(item.id as Language)}
+                    onClick={() => {
+                      setLanguage(item.id as Language);
+                      languageRef.current = item.id as Language;
+                    }}
                     className={`p-2.5 rounded-xl border text-center transition-all ${
                       language === item.id
                         ? "bg-indigo-600/20 border-indigo-500 text-white shadow-sm shadow-indigo-500/20"

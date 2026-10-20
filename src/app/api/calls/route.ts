@@ -103,11 +103,11 @@ export async function POST(req: NextRequest) {
     const callData: CallRecord = JSON.parse(callDataJson);
     const audioFile = formData.get("audio") as File | null;
 
-    let recordingPath = callData.recordingPath || "";
+    let recordingPath = "";
     let recordingUrl = "";
 
-    // If audio is provided and user consented, upload to Supabase Storage
-    if (audioFile && callData.recordingConsent) {
+    // 1. Only process and upload audio if affirmative consent was granted
+    if (callData.recordingConsent && audioFile) {
       const fileName = `${callData.id}.webm`;
       const arrayBuffer = await audioFile.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
@@ -115,14 +115,15 @@ export async function POST(req: NextRequest) {
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from("call-recordings")
         .upload(fileName, buffer, {
-          contentType: audioFile.type || "audio/webm",
+          contentType: audioFile.type || callData.recordingMimeType || "audio/webm",
           upsert: true,
         });
 
       if (uploadError) {
-        console.warn("Supabase Storage upload warning:", uploadError.message);
+        console.warn("[CallsAPI] Storage upload failed:", uploadError.message);
       } else if (uploadData?.path) {
         recordingPath = uploadData.path;
+        console.log(`[CallsAPI] Audio uploaded to storage: ${recordingPath}`);
         const { data: signed } = await supabase.storage
           .from("call-recordings")
           .createSignedUrl(recordingPath, 3600);
@@ -130,6 +131,26 @@ export async function POST(req: NextRequest) {
           recordingUrl = signed.signedUrl;
         }
       }
+    }
+
+    // 2. Preserve existing recording_path if this is an update and no new upload occurred
+    if (!recordingPath && callData.recordingConsent && callData.recordingPath) {
+      recordingPath = callData.recordingPath;
+    } else if (!recordingPath && callData.id) {
+      const { data: existingRow } = await supabase
+        .from("calls")
+        .select("recording_path")
+        .eq("id", callData.id)
+        .maybeSingle();
+      if (existingRow?.recording_path) {
+        recordingPath = existingRow.recording_path;
+      }
+    }
+
+    // If recording consent is explicitly false, recording_path must remain empty
+    if (!callData.recordingConsent) {
+      recordingPath = "";
+      recordingUrl = "";
     }
 
     // Insert or update calls table
@@ -156,7 +177,9 @@ export async function POST(req: NextRequest) {
       recording_path: recordingPath || null,
       recording_mime_type: callData.recordingMimeType || "audio/webm",
       recording_consent: Boolean(callData.recordingConsent),
-      recording_consent_at: callData.recordingConsentAt || null,
+      recording_consent_at: callData.recordingConsent
+        ? callData.recordingConsentAt || new Date().toISOString()
+        : null,
     };
 
     const { error: dbError } = await supabase
@@ -164,14 +187,15 @@ export async function POST(req: NextRequest) {
       .upsert(dbPayload, { onConflict: "id" });
 
     if (dbError) {
-      console.error("Supabase upsert calls error:", dbError.message);
+      console.error("[CallsAPI] Supabase upsert calls error:", dbError.message);
       return NextResponse.json({ error: dbError.message }, { status: 500 });
     }
 
     const savedRecord: CallRecord = {
       ...callData,
-      recordingPath,
-      recordingUrl: recordingUrl || callData.recordingUrl,
+      recordingPath: recordingPath || undefined,
+      recordingUrl: recordingUrl || (recordingPath ? callData.recordingUrl : undefined),
+      recordingConsent: Boolean(callData.recordingConsent),
       storageProvider: "supabase",
     };
 

@@ -22,8 +22,14 @@ export class GeminiLiveClient {
   private callbacks: LiveClientCallbacks;
   private language: Language = "en";
   private currentAiMessageId: string | null = null;
+  private currentAiMessageText: string = "";
   private currentCustomerMessageId: string | null = null;
   private recognition: unknown = null;
+
+  // Diagnostic metrics
+  private outboundAudioChunksCount: number = 0;
+  private inboundAudioChunksCount: number = 0;
+  private lastMicLogTime: number = 0;
 
   constructor(callbacks: LiveClientCallbacks) {
     this.callbacks = callbacks;
@@ -44,6 +50,10 @@ export class GeminiLiveClient {
     this.language = language;
     this.micStream = micStream;
     this.aiOutputDestinationNode = aiOutputDestinationNode;
+    this.outboundAudioChunksCount = 0;
+    this.inboundAudioChunksCount = 0;
+    this.currentAiMessageId = null;
+    this.currentAiMessageText = "";
 
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     this.audioContext = sharedAudioContext || new AudioCtx();
@@ -51,6 +61,7 @@ export class GeminiLiveClient {
       await this.audioContext.resume();
     }
 
+    console.log(`[GeminiLive] Initiating connection to model: ${model}, voice: ${voiceName}, language: ${language}`);
     this.callbacks.onStatusChange("connecting");
 
     // Endpoint for constrained ephemeral tokens
@@ -66,6 +77,7 @@ export class GeminiLiveClient {
 
     this.ws.onopen = () => {
       this.isConnected = true;
+      console.log("[GeminiLive] WebSocket connection established successfully.");
       this.callbacks.onStatusChange("connected");
 
       // Send initial setup message
@@ -92,6 +104,7 @@ export class GeminiLiveClient {
       };
 
       this.ws?.send(JSON.stringify(setupMessage));
+      console.log("[GeminiLive] Setup handshake message transmitted.");
 
       // Start processing and streaming mic audio
       this.startMicStreaming();
@@ -113,25 +126,23 @@ export class GeminiLiveClient {
           this.handleServerMessage(data as Record<string, unknown>);
         }
       } catch (err) {
-        console.warn("Failed to parse incoming Gemini Live message:", err);
+        console.warn("[GeminiLive] Failed to parse incoming WebSocket message:", err);
       }
     };
 
     this.ws.onerror = (err) => {
-      console.error("Gemini Live WebSocket error:", err);
+      console.error("[GeminiLive] WebSocket transport error:", err);
       this.callbacks.onError(
-        "WebSocket connection error with Gemini Live API. Please check network or API quota."
+        "WebSocket connection error with Gemini Live API. Please verify network connectivity."
       );
       this.callbacks.onStatusChange("error");
     };
 
     this.ws.onclose = (event) => {
+      console.log(`[GeminiLive] WebSocket connection closed. Code: ${event.code}, Clean: ${event.wasClean}`);
       this.isConnected = false;
       this.cleanupAudio();
       this.callbacks.onClose();
-      if (!event.wasClean) {
-        console.warn("WebSocket closed abruptly. Code:", event.code, "Reason:", event.reason);
-      }
     };
   }
 
@@ -178,6 +189,7 @@ export class GeminiLiveClient {
           if (!transcriptText) continue;
 
           if (e.results[i].isFinal) {
+            console.log(`[GeminiLive] Customer final speech detected (${transcriptText.length} chars)`);
             this.callbacks.onTranscriptMessage({
               id: `user-${Date.now()}-${finalIndex++}`,
               speaker: "customer",
@@ -217,8 +229,9 @@ export class GeminiLiveClient {
 
       recognition.start();
       this.recognition = recognition;
+      console.log("[GeminiLive] Supplementary browser speech recognition active.");
     } catch (e) {
-      console.warn("Could not start supplementary speech recognition:", e);
+      console.warn("[GeminiLive] Could not start supplementary speech recognition:", e);
     }
   }
 
@@ -228,6 +241,7 @@ export class GeminiLiveClient {
   private handleServerMessage(message: Record<string, unknown>): void {
     // 1. Setup complete -> Trigger AI's opening greeting
     if (message.setupComplete) {
+      console.log("[GeminiLive] Event: setupComplete received. Triggering opening greeting.");
       this.sendInitialGreetingPrompt();
       return;
     }
@@ -237,6 +251,7 @@ export class GeminiLiveClient {
 
     // 2. Interruption handling: User started speaking while AI was talking
     if (serverContent.interrupted) {
+      console.log("[GeminiLive] Event: interrupted. Stopping AI audio playback immediately.");
       this.stopAiAudioPlayback();
       this.callbacks.onStatusChange("listening");
       return;
@@ -246,19 +261,35 @@ export class GeminiLiveClient {
     const modelTurn = serverContent.modelTurn as {
       parts?: Array<{
         text?: string;
+        thought?: boolean;
         inlineData?: { mimeType: string; data: string };
       }>;
     };
 
     if (modelTurn?.parts) {
       for (const part of modelTurn.parts) {
-        // Output text from model
+        // Filter out any internal thought tokens or planning parts
+        if (part.thought) {
+          console.log("[GeminiLive] Filtered internal thought token from modelTurn.");
+          continue;
+        }
+
+        // Output text from model: ensure we don't display internal commentary
         if (part.text) {
-          this.handleAiTranscriptChunk(part.text);
+          const trimmed = part.text.trim();
+          const isThoughtCommentary =
+            /^(\*|\(|\[)?(refining|thinking|drafting|planning|internal|composing)/i.test(trimmed);
+
+          if (!isThoughtCommentary) {
+            this.handleAiTranscriptChunk(part.text);
+          } else {
+            console.log("[GeminiLive] Filtered planning commentary from modelTurn:", trimmed);
+          }
         }
 
         // Output audio from model
         if (part.inlineData && part.inlineData.mimeType.startsWith("audio/pcm")) {
+          this.inboundAudioChunksCount++;
           this.callbacks.onStatusChange("speaking");
           const pcmData = this.base64ToArrayBuffer(part.inlineData.data);
           // Standard Live API audio output is 24000Hz 16-bit mono PCM
@@ -273,13 +304,17 @@ export class GeminiLiveClient {
         | { text?: string }
         | undefined;
     if (inputTranscription?.text) {
-      this.callbacks.onTranscriptMessage({
-        id: `cust-${Date.now()}`,
-        speaker: "customer",
-        text: inputTranscription.text,
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-        isFinal: true,
-      });
+      const text = inputTranscription.text.trim();
+      if (text) {
+        console.log(`[GeminiLive] Event: inputAudioTranscription (${text.length} chars)`);
+        this.callbacks.onTranscriptMessage({
+          id: `cust-live-${Date.now()}`,
+          speaker: "customer",
+          text,
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          isFinal: true,
+        });
+      }
     }
 
     // 5. Output audio transcription (AI speech transcription recognized by Gemini Live)
@@ -288,12 +323,28 @@ export class GeminiLiveClient {
         | { text?: string }
         | undefined;
     if (outputTranscription?.text) {
-      this.handleAiTranscriptChunk(outputTranscription.text);
+      const trimmed = outputTranscription.text.trim();
+      if (!/^(\*|\(|\[)?(refining|thinking|drafting|planning)/i.test(trimmed)) {
+        this.handleAiTranscriptChunk(outputTranscription.text);
+      }
     }
 
     // 6. Turn complete
     if (serverContent.turnComplete) {
+      console.log(`[GeminiLive] Event: turnComplete. Inbound audio chunks so far: ${this.inboundAudioChunksCount}`);
+      // Finalize the current AI message if pending
+      if (this.currentAiMessageId && this.currentAiMessageText) {
+        this.callbacks.onTranscriptMessage({
+          id: this.currentAiMessageId,
+          speaker: "ai",
+          text: this.currentAiMessageText.trim(),
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          isFinal: true,
+        });
+      }
       this.currentAiMessageId = null;
+      this.currentAiMessageText = "";
+
       // Wait for queued audio to finish playing before switching back to "listening"
       setTimeout(() => {
         if (this.isConnected && this.activeAudioSources.length === 0) {
@@ -304,21 +355,24 @@ export class GeminiLiveClient {
   }
 
   /**
-   * Appends or creates AI transcript message
+   * Appends or creates AI transcript message (accumulates streamed chunks)
    */
   private handleAiTranscriptChunk(chunkText: string): void {
-    const text = chunkText.trim();
-    if (!text) return;
+    if (!chunkText) return;
 
-    const id = this.currentAiMessageId || `ai-${Date.now()}`;
-    this.currentAiMessageId = id;
+    if (!this.currentAiMessageId) {
+      this.currentAiMessageId = `ai-${Date.now()}`;
+      this.currentAiMessageText = "";
+    }
+
+    this.currentAiMessageText += chunkText;
 
     this.callbacks.onTranscriptMessage({
-      id,
+      id: this.currentAiMessageId,
       speaker: "ai",
-      text,
+      text: this.currentAiMessageText.trim(),
       timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-      isFinal: true,
+      isFinal: false,
     });
   }
 
@@ -328,11 +382,15 @@ export class GeminiLiveClient {
   private sendInitialGreetingPrompt(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    let greetingInstruction = "Please greet the prospective customer warmly and ask what job role or career step they are preparing for.";
+    // Direct command to deliver the opening customer greeting immediately without internal thinking
+    let greetingCommand =
+      "Please speak your opening greeting directly to the customer right now: 'Hi there! I'm Alex from ResumePilot AI. What kind of job or internship are you looking for?' Do not include any thoughts or planning commentary.";
     if (this.language === "hi") {
-      greetingInstruction = "कृपया ग्राहक का हिंदी में गर्मजोशी से स्वागत करें और पूछें कि वे किस नौकरी या इंटर्नशिप की तैयारी कर रहे हैं।";
+      greetingCommand =
+        "कृपया ग्राहक से सीधे हिंदी में अपना प्रारंभिक अभिवादन बोलें: 'नमस्ते! मैं ResumePilot AI से एलेक्स बात कर रहा हूँ। क्या आप अभी किसी नई नौकरी या इंटर्नशिप की तैयारी कर रहे हैं?' कोई आंतरिक विचार न बोलें।";
     } else if (this.language === "mr") {
-      greetingInstruction = "कृपया ग्राहकाचे मराठीत आदरपूर्वक स्वागत करा आणि विचारा की ते कोणत्या नोकरी किंवा इंटर्नशिपसाठी तयारी करत आहेत.";
+      greetingCommand =
+        "कृपया ग्राहकाशी थेट मराठीत बोला: 'नमस्कार! मी ResumePilot AI कडून अ‍ॅलेक्स बोलत आहे. सध्या तुम्ही नवीन नोकरी किंवा इंटर्नशिप शोधत आहात का?' कोणताही विचार न दाखवता थेट बोला.";
     }
 
     const greetingMessage = {
@@ -340,13 +398,14 @@ export class GeminiLiveClient {
         turns: [
           {
             role: "user",
-            parts: [{ text: greetingInstruction }],
+            parts: [{ text: greetingCommand }],
           },
         ],
         turnComplete: true,
       },
     };
 
+    console.log("[GeminiLive] Transmitting direct opening greeting command.");
     this.ws.send(JSON.stringify(greetingMessage));
     this.callbacks.onStatusChange("listening");
   }
@@ -357,7 +416,6 @@ export class GeminiLiveClient {
   private startMicStreaming(): void {
     if (!this.audioContext || !this.micStream) return;
 
-    // Use ScriptProcessorNode (bufferSize: 4096) for reliable cross-browser PCM streaming
     const bufferSize = 4096;
     this.micSource = this.audioContext.createMediaStreamSource(this.micStream);
     this.micProcessor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
@@ -368,6 +426,21 @@ export class GeminiLiveClient {
       const inputBuffer = event.inputBuffer.getChannelData(0);
       const inputSampleRate = event.inputBuffer.sampleRate;
       const targetSampleRate = 16000;
+
+      // Diagnostic audio level calculation
+      let sumSquares = 0;
+      for (let i = 0; i < inputBuffer.length; i++) {
+        sumSquares += inputBuffer[i] * inputBuffer[i];
+      }
+      const rms = Math.sqrt(sumSquares / inputBuffer.length);
+
+      const now = Date.now();
+      if (now - this.lastMicLogTime > 4000) {
+        this.lastMicLogTime = now;
+        console.log(
+          `[GeminiLive] Mic streaming active: ${this.outboundAudioChunksCount} chunks sent, current RMS: ${rms.toFixed(4)}`
+        );
+      }
 
       // Downsample to 16kHz
       const downsampledBuffer = this.downsampleTo16k(
@@ -431,6 +504,8 @@ export class GeminiLiveClient {
    */
   private sendRealtimeAudio(base64Data: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.outboundAudioChunksCount++;
 
     const realtimeInput = {
       realtimeInput: {
